@@ -16,7 +16,7 @@ import RealmSwift
 import RxCocoa
 import RxSwift
 
-final class MenuManager: NSObject {
+final class MenuManager: NSObject, NSMenuDelegate {
 
     // MARK: - Properties
     // Menus
@@ -37,6 +37,10 @@ final class MenuManager: NSObject {
     fileprivate let realm = try! Realm()
     fileprivate var clipToken: NotificationToken?
     fileprivate var snippetToken: NotificationToken?
+    // Search
+    fileprivate var searchText = ""
+    fileprivate var isMenuOpen = false
+    fileprivate weak var searchMenuItemView: SearchMenuItemView?
 
     // MARK: - Enum Values
     enum StatusType: Int {
@@ -100,12 +104,14 @@ private extension MenuManager {
         clipToken = realm.objects(CPYClip.self)
                         .observe { [weak self] _ in
                             DispatchQueue.main.async { [weak self] in
+                                guard self?.isMenuOpen == false else { return }
                                 self?.createClipMenu()
                             }
                         }
         snippetToken = realm.objects(CPYFolder.self)
                         .observe { [weak self] _ in
                             DispatchQueue.main.async { [weak self] in
+                                guard self?.isMenuOpen == false else { return }
                                 self?.createClipMenu()
                             }
                         }
@@ -122,14 +128,15 @@ private extension MenuManager {
             .compactMap { $0 }
             .asDriver(onErrorDriveWith: .empty())
             .drive(onNext: { [weak self] _ in
-                guard let wSelf = self else { return }
-                wSelf.createClipMenu()
+                guard self?.isMenuOpen == false else { return }
+                self?.createClipMenu()
             })
             .disposed(by: disposeBag)
         // Edit snippets
         notificationCenter.rx.notification(Notification.Name(rawValue: Constants.Notification.closeSnippetEditor))
             .asDriver(onErrorDriveWith: .empty())
             .drive(onNext: { [weak self] _ in
+                guard self?.isMenuOpen == false else { return }
                 self?.createClipMenu()
             })
             .disposed(by: disposeBag)
@@ -166,6 +173,7 @@ private extension MenuManager {
             .throttle(.seconds(1), scheduler: MainScheduler.instance)
             .asDriver(onErrorDriveWith: .empty())
             .drive(onNext: { [weak self] in
+                guard self?.isMenuOpen == false else { return }
                 self?.createClipMenu()
             })
             .disposed(by: disposeBag)
@@ -176,13 +184,24 @@ private extension MenuManager {
 private extension MenuManager {
      func createClipMenu() {
         clipMenu = NSMenu(title: Constants.Application.name)
+        clipMenu?.delegate = self
         historyMenu = NSMenu(title: Constants.Menu.history)
         snippetMenu = NSMenu(title: Constants.Menu.snippet)
 
-        addHistoryItems(clipMenu!)
+        let searchView = SearchMenuItemView(frame: .zero)
+        searchView.onSearch = { [weak self] query in
+            self?.searchText = query
+            self?.updateMenuItems()
+        }
+        let searchItem = NSMenuItem()
+        searchItem.view = searchView
+        clipMenu?.addItem(searchItem)
+        searchMenuItemView = searchView
+
+        addHistoryItems(clipMenu!, query: nil)
         addHistoryItems(historyMenu!)
 
-        addSnippetItems(clipMenu!, separateMenu: true)
+        addSnippetItems(clipMenu!, separateMenu: true, query: nil)
         addSnippetItems(snippetMenu!, separateMenu: false)
 
         clipMenu?.addItem(NSMenuItem.separator())
@@ -197,6 +216,28 @@ private extension MenuManager {
         clipMenu?.addItem(NSMenuItem(title: L10n.quitClipy, action: #selector(AppDelegate.terminate)))
 
         statusItem?.menu = clipMenu
+    }
+
+    func updateMenuItems() {
+        guard let menu = clipMenu else { return }
+        let staticTailCount = staticTailItemCount()
+        let lastDynamicIndex = menu.numberOfItems - staticTailCount - 1
+        if lastDynamicIndex >= 1 {
+            for index in stride(from: lastDynamicIndex, through: 1, by: -1) {
+                menu.removeItem(at: index)
+            }
+        }
+        let query: String? = searchText.isEmpty ? nil : searchText
+        addHistoryItems(menu, query: query)
+        addSnippetItems(menu, separateMenu: true, query: query)
+    }
+
+    func staticTailItemCount() -> Int {
+        var count = 5 // separator + editSnippets + preferences + separator + quit
+        if AppEnvironment.current.defaults.bool(forKey: Constants.UserDefaults.addClearHistoryMenuItem) {
+            count += 1
+        }
+        return count
     }
 
     func menuItemTitle(_ title: String, listNumber: NSInteger, isMarkWithNumber: Bool) -> String {
@@ -257,7 +298,7 @@ private extension MenuManager {
 
 // MARK: - Clips
 private extension MenuManager {
-    func addHistoryItems(_ menu: NSMenu) {
+    func addHistoryItems(_ menu: NSMenu, query: String? = nil) {
         let placeInLine = AppEnvironment.current.defaults.integer(forKey: Constants.UserDefaults.numberOfItemsPlaceInline)
         let placeInsideFolder = AppEnvironment.current.defaults.integer(forKey: Constants.UserDefaults.numberOfItemsPlaceInsideFolder)
         let maxHistory = AppEnvironment.current.defaults.integer(forKey: Constants.UserDefaults.maxHistorySize)
@@ -276,6 +317,19 @@ private extension MenuManager {
         let ascending = !AppEnvironment.current.defaults.bool(forKey: Constants.UserDefaults.reorderClipsAfterPasting)
         let clipResults = realm.objects(CPYClip.self).sorted(byKeyPath: #keyPath(CPYClip.updateTime), ascending: ascending)
         let currentSize = Int(clipResults.count)
+
+        if let query = query, !query.isEmpty {
+            let lowercased = query.lowercased()
+            let matching = clipResults.filter { $0.title.lowercased().contains(lowercased) }
+            var listNumber = firstIndexOfMenuItems()
+            for (i, clip) in matching.enumerated() {
+                let menuItem = makeClipMenuItem(clip, index: i, listNumber: listNumber)
+                menu.addItem(menuItem)
+                listNumber = incrementListNumber(listNumber, max: kMaxKeyEquivalents, start: firstIndexOfMenuItems())
+            }
+            return
+        }
+
         var i = 0
         for clip in clipResults {
             if placeInLine < 1 || placeInLine - 1 < i {
@@ -371,7 +425,7 @@ private extension MenuManager {
 
 // MARK: - Snippets
 private extension MenuManager {
-    func addSnippetItems(_ menu: NSMenu, separateMenu: Bool) {
+    func addSnippetItems(_ menu: NSMenu, separateMenu: Bool, query: String? = nil) {
         let folderResults = realm.objects(CPYFolder.self).sorted(byKeyPath: #keyPath(CPYFolder.index), ascending: true)
         guard !folderResults.isEmpty else { return }
         if separateMenu {
@@ -382,6 +436,27 @@ private extension MenuManager {
         let labelItem = NSMenuItem(title: L10n.snippet, action: nil)
         labelItem.isEnabled = false
         menu.addItem(labelItem)
+
+        if let query = query, !query.isEmpty {
+            let lowercased = query.lowercased()
+            var listNumber = firstIndexOfMenuItems()
+            folderResults
+                .filter { $0.enable }
+                .forEach { folder in
+                    folder.snippets
+                        .sorted(byKeyPath: #keyPath(CPYSnippet.index), ascending: true)
+                        .filter { $0.enable }
+                        .filter {
+                            $0.title.lowercased().contains(lowercased) ||
+                            $0.content.lowercased().contains(lowercased)
+                        }
+                        .forEach { snippet in
+                            menu.addItem(makeSnippetMenuItem(snippet, listNumber: listNumber))
+                            listNumber += 1
+                        }
+                }
+            return
+        }
 
         var subMenuIndex = menu.numberOfItems - 1
         let firstIndex = firstIndexOfMenuItems()
@@ -459,5 +534,24 @@ private extension MenuManager {
 private extension MenuManager {
     func firstIndexOfMenuItems() -> NSInteger {
         return AppEnvironment.current.defaults.bool(forKey: Constants.UserDefaults.menuItemsTitleStartWithZero) ? 0 : 1
+    }
+}
+
+// MARK: - NSMenuDelegate
+extension MenuManager {
+    func menuWillOpen(_ menu: NSMenu) {
+        guard menu === clipMenu else { return }
+        isMenuOpen = true
+        DispatchQueue.main.async { [weak self] in
+            self?.searchMenuItemView?.focusSearchField()
+        }
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        guard menu === clipMenu else { return }
+        isMenuOpen = false
+        searchMenuItemView?.clearSearchField()
+        searchText = ""
+        createClipMenu()
     }
 }

@@ -1,0 +1,41 @@
+name: Build
+
+on:
+  push:
+    branches: [ develop, main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CocoaPods dependencies
+        run: |
+          cd $GITHUB_WORKSPACE
+          pod install
+
+      - name: Build
+        run: |
+          xcodebuild \
+            -workspace Clipy.xcworkspace \
+            -scheme Clipy \
+            -configuration Release \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Package app
+        run: |
+          cd build/Build/Products/Release
+          zip -r Clipy.zip Clipy.app
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Clipy
+          path: build/Build/Products/Release/Clipy.zip
+          retention-days: 7
